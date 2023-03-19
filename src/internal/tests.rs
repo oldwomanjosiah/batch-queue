@@ -29,17 +29,23 @@ fn rx_all<T: Send>(rx: &mut Rx<T>) -> Vec<T> {
     out
 }
 
+#[cfg(miri)]
+#[test]
+fn create_drop() {
+    channel::<()>(16);
+}
+
 #[test]
 fn send_once() {
     let (mut rx, tx) = channel(16);
 
-    std::thread::scope(|s| {
-        s.spawn(move || {
-            tx.blocking_send(2).unwrap();
-        });
-
-        let received = rx_all(&mut rx);
-
-        assert_eq!(received, &[2]);
+    let t = std::thread::spawn(move || {
+        tx.blocking_send(2).unwrap();
     });
+
+    let received = rx_all(&mut rx);
+
+    assert_eq!(received, &[2]);
+
+    t.join().unwrap();
 }

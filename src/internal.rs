@@ -575,7 +575,7 @@ impl<T> Block<T> {
             Ordering::Relaxed,
         ) {
             debug_assert!(
-                curr < locked,
+                curr <= locked,
                 "Locked incremented past us while we were waiting to release slot"
             );
             // We could also block on written here, and unconditionally notify below. The case
