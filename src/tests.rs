@@ -205,3 +205,64 @@ fn fanout_send() {
         assert!(actual.contains(&i));
     }
 }
+
+#[test]
+fn unreceived_dropped() {
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Debug, Default)]
+    struct NeedsDrop {
+        been_dropped: bool,
+    }
+
+    impl Drop for NeedsDrop {
+        fn drop(&mut self) {
+            // Check that consuming logic is correct
+            // This assert will only fail if we accidentally drop any already dropped item.
+            assert!(!self.been_dropped, "Instance was dropped multiple times");
+            self.been_dropped = true;
+
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let (mut rx, tx) = channel(32);
+
+    let t = std::thread::spawn(move || {
+        for _ in 0..32 {
+            tx.blocking_send(NeedsDrop::default()).unwrap();
+        }
+    });
+
+    {
+        let block = rx.shared.get_block().unwrap();
+
+        loop {
+            let locked = block.locked.load(Ordering::Acquire);
+
+            if locked == 16 {
+                break;
+            }
+
+            std::hint::spin_loop();
+        }
+    }
+
+    let mut out = Vec::with_capacity(16);
+
+    // By only taking half a batch here we are testing that partially consumed batches have their
+    // contents correcty dropped.
+    while out.len() < 8 {
+        let rx = rx.recv();
+        out.extend(rx.take(8 - out.len()));
+    }
+
+    // Join so that we wait for it to finish writing into the newly shared shared block,
+    // Tests that we drop shared items as well.
+    t.join().unwrap();
+    drop(rx);
+
+    assert_eq!(DROPS.load(Ordering::Acquire), 32 - 8);
+    drop(out);
+    assert_eq!(DROPS.load(Ordering::Acquire), 32);
+}
