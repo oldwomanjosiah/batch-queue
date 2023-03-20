@@ -1,3 +1,5 @@
+use std::sync::atomic::AtomicUsize;
+
 use super::*;
 
 #[test]
@@ -19,7 +21,11 @@ fn rx_all<T: Send>(rx: &mut Rx<T>) -> Vec<T> {
     let mut out = Vec::new();
 
     loop {
-        out.extend(rx.recv());
+        let it = rx.recv();
+
+        eprintln!("rx_all: {} items", it.len());
+
+        out.extend(it);
 
         if !rx.may_rx() {
             break;
@@ -48,4 +54,154 @@ fn send_once() {
     assert_eq!(received, &[2]);
 
     t.join().unwrap();
+}
+
+#[test]
+fn always_swap() {
+    let (mut rx, tx) = channel(2);
+
+    let t = std::thread::spawn(move || {
+        for i in 0..128 {
+            tx.blocking_send(i).unwrap();
+        }
+    });
+
+    let received = rx_all(&mut rx);
+
+    let expected = {
+        let mut it = Vec::with_capacity(128);
+        it.extend(0..128);
+        it
+    };
+
+    assert_eq!(received, expected);
+
+    t.join().unwrap();
+}
+
+#[test]
+fn always_fill() {
+    let batch_size = 4;
+    let total = 64 * batch_size;
+
+    let (mut rx, tx) = channel(batch_size * 2);
+    let sent = Arc::new(AtomicUsize::new(0));
+
+    let t = std::thread::spawn({
+        let sent = sent.clone();
+        move || {
+            for i in 0..total {
+                tx.blocking_send(i).unwrap();
+                sent.fetch_add(1, Ordering::Release);
+            }
+        }
+    });
+
+    for batch in 0..(total / batch_size) {
+        while sent.load(Ordering::Acquire) < (batch + 1) * batch_size {
+            std::hint::spin_loop();
+        }
+
+        let start = batch * batch_size;
+        let expected: Vec<_> = (start..(start + batch_size)).collect();
+        let mut curr = Vec::new();
+        loop {
+            let rem = batch_size - curr.len();
+            if rem == 0 {
+                break;
+            }
+            curr.extend(rx.recv().take(rem));
+        }
+
+        assert_eq!(curr, expected);
+    }
+
+    t.join().unwrap();
+}
+
+#[test]
+fn send_many() {
+    let (mut rx, tx) = channel(16);
+
+    let t = std::thread::spawn(move || {
+        for i in 0..2048 {
+            tx.blocking_send(i).unwrap();
+        }
+    });
+
+    let received = rx_all(&mut rx);
+
+    let expected = {
+        let mut it = Vec::with_capacity(2048);
+        it.extend(0..2048);
+        it
+    };
+
+    assert_eq!(received, expected);
+
+    t.join().unwrap();
+}
+
+#[test]
+fn fill_once() {
+    let (mut rx, tx) = channel(16 * 2);
+
+    let t = std::thread::spawn(move || {
+        for i in 0..16 {
+            tx.blocking_send(i).unwrap();
+        }
+    });
+
+    {
+        let block = rx.shared.get_block().unwrap();
+        loop {
+            let locked = block.locked.load(Ordering::Acquire);
+
+            if locked == 16 {
+                break;
+            }
+
+            std::hint::spin_loop();
+        }
+    }
+
+    let actual: Vec<_> = rx_all(&mut rx);
+
+    t.join().unwrap();
+
+    let expected: Vec<_> = (0..16).collect();
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn fanout_send() {
+    let (mut rx, tx) = channel(32);
+
+    let ts = (0..16)
+        .map(|id| {
+            let tx = tx.clone();
+
+            std::thread::Builder::new()
+                .name(format!("Sender: {id}"))
+                .spawn(move || {
+                    for i in 0..16 {
+                        tx.blocking_send(i + 16 * id).unwrap();
+                    }
+                })
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    drop(tx);
+
+    let actual = rx_all(&mut rx);
+
+    for t in ts {
+        t.join().unwrap()
+    }
+
+    for i in 0..(16 * 16) {
+        assert!(actual.contains(&i));
+    }
 }

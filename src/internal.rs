@@ -53,7 +53,10 @@ pub struct Rx<T> {
     shared: Arc<Shared<T>>,
 }
 
-pub struct Batch<'rx, T>(&'rx mut Rx<T>);
+pub struct Batch<'rx, T> {
+    inner: &'rx mut Rx<T>,
+    written: u32,
+}
 
 struct Shared<T> {
     /// Capacity of each of the shared blocks, saved here so that it does not have to be read from
@@ -136,6 +139,14 @@ where
     }
 }
 
+impl<T> Clone for Tx<T> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
 impl<T> Rx<T> {
     fn get_block(&self) -> &Block<T> {
         // Safety:
@@ -155,6 +166,7 @@ impl<T> Rx<T> {
     ///   Must not be called if already called once.
     unsafe fn deallocate_blocks(&mut self) {
         let shared = self.shared.take_block().unwrap();
+        let owned = self.block;
 
         {
             // Safety:
@@ -163,6 +175,7 @@ impl<T> Rx<T> {
             //   all internal mut is through atomics or `UnsafeCell`
             // - Null written when taking, so is not dangling if unwrap returned.
             let shared_ref = unsafe { shared.as_ref() };
+
             let shared_locked = shared_ref.mark_locked();
             shared_ref.wait_written(shared_locked);
             shared_ref.drop_range_in_place(0, shared_locked);
@@ -248,12 +261,16 @@ impl<T> Rx<T> {
     fn swap_blocks(&mut self) {
         self.finalize_current();
 
-        self.block = self
+        let new = self
             .shared
             .swap_block(self.block)
             .expect("swap_blocks called after destructor run");
 
-        self.locked = self.get_block().mark_locked();
+        self.block = new;
+
+        let new_locked = self.get_block().mark_locked();
+
+        self.locked = new_locked;
     }
 
     /// Indicates whether we are ready for a swap.
@@ -271,7 +288,12 @@ impl<T> Rx<T> {
             self.swap_blocks();
         }
 
-        Batch(self)
+        let written = self.get_block().get_written();
+
+        Batch {
+            inner: self,
+            written,
+        }
     }
 }
 
@@ -279,7 +301,7 @@ unsafe impl<T> Send for Rx<T> {}
 
 impl<T> Drop for Batch<'_, T> {
     fn drop(&mut self) {
-        let Self(rx) = self;
+        let Self { inner: rx, .. } = self;
 
         // Swap here if we are more likely to have a full batch next time.
         if rx.should_swap() {
@@ -294,23 +316,30 @@ impl<T> Iterator for Batch<'_, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let Self(rx) = self;
-        let written = rx.get_block().get_written();
+        let Self { inner: rx, written } = self;
         let next = rx.consumed;
 
-        if next < written {
-            rx.consumed += 1;
-            let block = rx.get_block();
-            // Safety:
-            // - next < written by if guard
-            // - `get_written` guarantees all writes to next have been published
-            // - we increment consumed each time we consume, so this slot has not yet been consumed
-            Some(unsafe { block.take(next) })
-        } else {
-            None
+        if next >= *written {
+            return None;
         }
+
+        rx.consumed += 1;
+        let block = rx.get_block();
+
+        // Safety:
+        // - next < written by if guard
+        // - `get_written` guarantees all writes to next have been published
+        // - we increment consumed each time we consume, so this slot has not yet been consumed
+        Some(unsafe { block.take(next) })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let rem = self.written - self.inner.consumed;
+        (rem as _, Some(rem as _))
     }
 }
+
+impl<T> ExactSizeIterator for Batch<'_, T> {}
 
 impl<T> Drop for Rx<T> {
     fn drop(&mut self) {
@@ -340,7 +369,7 @@ impl<T> Shared<T> {
 
             if self
                 .block
-                .compare_exchange_weak(
+                .compare_exchange(
                     current.as_ptr(),
                     new.as_ptr(),
                     Ordering::Relaxed,
@@ -379,7 +408,7 @@ impl<T> Shared<T> {
             return false;
         };
 
-        block.locked.load(Ordering::Relaxed) != 0
+        block.written.load(Ordering::Relaxed) != 0
     }
 }
 
@@ -512,16 +541,6 @@ impl<T> Block<T> {
     /// - `idx` greater than or eq `written`
     /// - `idx` slot has no outstanding mutable references
     unsafe fn write(&self, idx: u32, it: T) {
-        #[cfg(debug_assertions)]
-        {
-            let written = self.written.load(Ordering::Relaxed);
-            let locked = self.locked.load(Ordering::Relaxed);
-            debug_assert!(
-                written as u32 <= idx && locked as u32 > idx,
-                "Trying to write value outside locked range: {idx} !in [{written}, {locked})"
-            );
-        }
-
         let slot_ref = &self.data[idx as usize];
 
         // Safety:
@@ -548,7 +567,7 @@ impl<T> Block<T> {
             // Increment locked to take our slot
             if self
                 .locked
-                .compare_exchange_weak(locked, locked + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .compare_exchange_weak(locked, locked + 1, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
                 break;
@@ -637,25 +656,27 @@ impl<T> Block<T> {
         }
     }
 
-    /// Wait on this block if it is full.
+    /// Wait on this block if it is fully locked (possibly not fully written)
     fn wait_if_full(&self) {
         let capacity = self.capacity();
 
-        loop {
-            let written = self.written.load(Ordering::Relaxed);
+        let locked = self.locked.load(Ordering::Relaxed);
 
-            if written != capacity {
-                break;
-            }
-
-            wait(&self.written, capacity);
+        if locked != capacity {
+            return;
         }
+
+        // Note: When returning from this call, it is not known that self is still valid.
+        //   We are sometimes woken in order to deallocate
+        wait(&self.locked, capacity);
     }
 
     /// Returns the currently written range end (exclusive).
     /// Memory ordering guarantees that all data written to this object have been published to this
     /// thread.
     fn get_written(&self) -> u32 {
+        // Acquire used here to pair with release in `push`, ensuring that data changes there
+        // have been published.
         self.written.load(Ordering::Acquire)
     }
 
@@ -702,8 +723,8 @@ impl<T> Block<T> {
     fn reset(&self) {
         #[cfg(debug_assertions)]
         {
-            let locked = self.locked.load(Ordering::Relaxed);
             let written = self.written.load(Ordering::Relaxed);
+            let locked = self.locked.load(Ordering::Acquire);
 
             assert!(
                 locked == written || locked == u32::MAX,
@@ -711,9 +732,10 @@ impl<T> Block<T> {
             );
         }
 
-        self.locked.store(0, Ordering::Relaxed);
+        // Ordering: Release used for lock, which is done second, to make sure that no slots are
+        // ever marked un-locked while marked unwritten.
         self.written.store(0, Ordering::Relaxed);
-        fence(Ordering::Release);
+        self.locked.store(0, Ordering::Release);
     }
 }
 
