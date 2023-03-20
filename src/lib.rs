@@ -1,3 +1,50 @@
+//! # batch-queue
+//!
+//! Multi-Producer Single-Consumer Queue Implementation that uses a batched strategy for tracking
+//! sends. Useful in cases where your consumption of items within a queue is extremely "bursty,"
+//! but it's okay if you don't receive every item you could right away.
+//!
+//! I built this for use in my personal graphics libraries, where we want to deal with requests
+//! within the render code. It's imperative that receiving is fast, but it's okay if a sender has
+//! to wait an extra frame for the request to be processed.
+//!
+//! ```rust
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!
+//! let (mut rx, tx) = batch_queue::channel(16);
+//!
+//! let ts: [_; 16] = std::array::from_fn({
+//!     move |j| {
+//!         let tx = tx.clone();
+//!         std::thread::spawn(move || {
+//!             for i in 0..16 {
+//!                 tx.blocking_send(i + j * 16)
+//!                     .expect("Sender Dropped");
+//!             }
+//!         })
+//!     }
+//! });
+//!
+//! # let mut out = Vec::with_capacity(16 * 16);
+//!
+//! while rx.may_rx() {
+//!     for it in rx.recv() {
+//!         println!("Got {it}!");
+//! #       out.push(it);
+//!     }
+//! }
+//!
+//! for t in ts {
+//!     t.join().unwrap();
+//! }
+//!
+//! # for i in 0..(16 * 16) {
+//! #   assert!(out.contains(&i));
+//! # }
+//! # Ok(())
+//! # }
+//! ```
+
 use atomic_wait::*;
 use std::{
     cell::UnsafeCell,
@@ -32,11 +79,11 @@ pub enum TrySendErrorType {
     Closed,
 }
 
-pub struct Tx<T> {
+pub struct Sender<T> {
     shared: Arc<Shared<T>>,
 }
 
-pub struct Rx<T> {
+pub struct Receiver<T> {
     /// The amount of items in `block` which we locked when swapping
     locked: u32,
 
@@ -53,7 +100,7 @@ pub struct Rx<T> {
 }
 
 pub struct Batch<'rx, T> {
-    inner: &'rx mut Rx<T>,
+    inner: &'rx mut Receiver<T>,
     written: u32,
 }
 
@@ -74,7 +121,7 @@ struct Block<T> {
 /// Create a new channel with a given capapcity.
 /// Capacity must be even and less `<= usize::MAX - 2`. To enforce this it will be rounded
 /// up, and capped to that value.
-pub fn channel<T>(capacity: usize) -> (Rx<T>, Tx<T>) {
+pub fn channel<T>(capacity: usize) -> (Receiver<T>, Sender<T>) {
     // Convert the capacity into a capacity for each half.
     let capacity = if capacity % 2 == 0 {
         capacity / 2
@@ -87,11 +134,11 @@ pub fn channel<T>(capacity: usize) -> (Rx<T>, Tx<T>) {
         block: AtomicPtr::new(Block::new_alloc(capacity).as_ptr()),
     });
 
-    let tx = Tx {
+    let tx = Sender {
         shared: shared.clone(),
     };
 
-    let rx = Rx {
+    let rx = Receiver {
         locked: 0,
         consumed: 0,
         shared,
@@ -103,7 +150,7 @@ pub fn channel<T>(capacity: usize) -> (Rx<T>, Tx<T>) {
 
 /// Sending functions for Tx. T must be send because Rx and Tx may have been sent across between
 /// threads at any point before these are called.
-impl<T> Tx<T>
+impl<T> Sender<T>
 where
     T: Send,
 {
@@ -136,7 +183,7 @@ where
     }
 }
 
-impl<T> Clone for Tx<T> {
+impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
         Self {
             shared: Arc::clone(&self.shared),
@@ -144,7 +191,7 @@ impl<T> Clone for Tx<T> {
     }
 }
 
-impl<T> Rx<T> {
+impl<T> Receiver<T> {
     fn get_block(&self) -> &Block<T> {
         // Safety:
         // - Alignment, Dereferencable, Initalized: Created by Box::new
@@ -202,19 +249,19 @@ impl<T> Rx<T> {
     }
 
     /// Get a new sender for this queue
-    fn get_tx(&self) -> Tx<T> {
-        Tx {
+    pub fn get_tx(&self) -> Sender<T> {
+        Sender {
             shared: self.shared.clone(),
         }
     }
 
     /// This queue instance has senders
-    fn has_senders(&self) -> bool {
+    pub fn has_senders(&self) -> bool {
         Arc::strong_count(&self.shared) != 1
     }
 
     /// This queue has senders or data that could be received
-    fn may_rx(&self) -> bool {
+    pub fn may_rx(&self) -> bool {
         self.has_senders()
             || self.get_block().get_written() != 0
             || self
@@ -276,7 +323,7 @@ impl<T> Rx<T> {
         self.current_consumed() && self.shared.non_empty()
     }
 
-    fn recv(&mut self) -> Batch<'_, T>
+    pub fn recv(&mut self) -> Batch<'_, T>
     where
         T: Send,
     {
@@ -294,7 +341,7 @@ impl<T> Rx<T> {
     }
 }
 
-unsafe impl<T> Send for Rx<T> {}
+unsafe impl<T> Send for Receiver<T> {}
 
 impl<T> Drop for Batch<'_, T> {
     fn drop(&mut self) {
@@ -338,7 +385,7 @@ impl<T> Iterator for Batch<'_, T> {
 
 impl<T> ExactSizeIterator for Batch<'_, T> {}
 
-impl<T> Drop for Rx<T> {
+impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         // Safety:
         // - Drop will be called at most 1 times

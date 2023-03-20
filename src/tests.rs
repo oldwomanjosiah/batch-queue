@@ -5,19 +5,19 @@ use super::*;
 #[test]
 fn auto_traits() {
     static_assertions::assert_impl_all!(
-        Rx<usize>: Send
+        Receiver<usize>: Send
     );
 
     static_assertions::assert_not_impl_any!(
-        Rx<usize>: Sync
+        Receiver<usize>: Sync
     );
 
     static_assertions::assert_impl_all!(
-        Tx<usize>: Send, Sync
+        Sender<usize>: Send, Sync
     );
 }
 
-fn rx_all<T: Send>(rx: &mut Rx<T>) -> Vec<T> {
+fn rx_all<T: Send>(rx: &mut Receiver<T>) -> Vec<T> {
     let mut out = Vec::new();
 
     loop {
