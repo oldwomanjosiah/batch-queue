@@ -1,6 +1,6 @@
-use std::hint::black_box;
+use std::{hint::black_box, time::Duration};
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Bencher, BenchmarkId, Criterion};
 
 fn on_render(fps: u64, mut block: impl FnMut() -> bool) {
     loop {
@@ -73,6 +73,32 @@ fn std_mpsc<const N: usize>(fps: u64, cap: usize, each_send: usize) {
     }
 }
 
+trait BencherExt {
+    fn iter_setup<R>(&mut self, res: R, setup: impl FnMut(&mut R), bench: impl FnMut(&mut R));
+}
+
+impl BencherExt for Bencher<'_> {
+    fn iter_setup<R>(
+        &mut self,
+        mut res: R,
+        mut setup: impl FnMut(&mut R),
+        mut bench: impl FnMut(&mut R),
+    ) {
+        self.iter_custom(|iters| {
+            let mut total = Duration::default();
+
+            for _ in 0..iters {
+                setup(&mut res);
+                let start = std::time::Instant::now();
+                bench(&mut res);
+                total += start.elapsed();
+            }
+
+            total
+        });
+    }
+}
+
 fn total_time(c: &mut Criterion) {
     c.benchmark_group("60 fps - 1 sender - 128 items - 32 cap")
         .bench_function("batch", |b| b.iter(|| batch::<1>(60, 32, 128)))
@@ -95,7 +121,54 @@ fn total_time(c: &mut Criterion) {
         .bench_function("mpsc", |b| b.iter(|| std_mpsc::<16>(60, 32, 128)));
 }
 
+fn recv_time(c: &mut Criterion) {
+    let mut group = c.benchmark_group("recv only");
+
+    for i in [16, 32, 64, 128, 256, 512] {
+        group.bench_function(BenchmarkId::new("batch", i), |b| {
+            b.iter_setup(
+                batch_queue::channel(i * 2),
+                |(_, tx)| {
+                    for i in 0..i {
+                        tx.try_send(i).unwrap();
+                    }
+                },
+                |(rx, _)| {
+                    let mut got = 0;
+                    while got < i {
+                        let rx = black_box(rx.recv());
+
+                        got += rx.len();
+
+                        for i in rx {
+                            let _i = black_box(i);
+                        }
+                    }
+                },
+            )
+        });
+
+        group.bench_function(BenchmarkId::new("mpsc", i), |b| {
+            b.iter_setup(
+                std::sync::mpsc::sync_channel(i),
+                |(tx, _)| {
+                    for i in 0..i {
+                        tx.try_send(i).unwrap();
+                    }
+                },
+                |(_, rx)| {
+                    for i in 0..i {
+                        let it = black_box(black_box(&rx).try_recv()).unwrap();
+                    }
+                },
+            )
+        });
+    }
+
+    group.finish();
+}
+
 // TODO(josiah) use custom iter functions to only measure the render thread time to get each batch.
 
-criterion_group!(group, total_time);
+criterion_group!(group, total_time, recv_time);
 criterion_main!(group);
