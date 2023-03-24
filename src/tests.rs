@@ -27,7 +27,7 @@ fn rx_all<T: Send>(rx: &mut Receiver<T>) -> Vec<T> {
 
         out.extend(it);
 
-        if !rx.may_rx() {
+        if !rx.may_recv() {
             break;
         }
     }

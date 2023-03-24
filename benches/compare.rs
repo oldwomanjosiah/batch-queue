@@ -33,7 +33,7 @@ fn batch<const N: usize>(fps: u64, cap: usize, each_send: usize) {
             let it = black_box(it);
         }
 
-        rx.may_rx()
+        rx.may_recv()
     });
 
     for t in ts {
