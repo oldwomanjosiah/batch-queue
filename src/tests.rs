@@ -35,7 +35,6 @@ fn rx_all<T: Send>(rx: &mut Receiver<T>) -> Vec<T> {
     out
 }
 
-#[cfg(miri)]
 #[test]
 fn create_drop() {
     channel::<()>(16);

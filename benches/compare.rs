@@ -30,7 +30,7 @@ fn batch<const N: usize>(fps: u64, cap: usize, each_send: usize) {
 
     on_render(fps, move || {
         for it in rx.recv() {
-            let it = black_box(it);
+            black_box(it);
         }
 
         rx.may_recv()
@@ -62,7 +62,7 @@ fn std_mpsc<const N: usize>(fps: u64, cap: usize, each_send: usize) {
 
         for it in std::iter::from_fn(|| rx.try_recv().ok()).take(cap).fuse() {
             got = true;
-            let it = black_box(it);
+            black_box(it);
         }
 
         got
@@ -157,8 +157,8 @@ fn recv_time(c: &mut Criterion) {
                     }
                 },
                 |(_, rx)| {
-                    for i in 0..i {
-                        let it = black_box(black_box(&rx).try_recv()).unwrap();
+                    for _ in 0..i {
+                        black_box(black_box(&rx).try_recv()).unwrap();
                     }
                 },
             )
